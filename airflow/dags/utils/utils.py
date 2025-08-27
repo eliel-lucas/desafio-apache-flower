@@ -6,8 +6,21 @@ import requests
 from zoneinfo import ZoneInfo 
 from datetime import datetime
 
+def bump_name(path: str, new_ext: str) -> str:
+    """
+    Generate a new file name by incrementing a numeric suffix.
 
-def bump_name(path, new_ext=None):
+    If the file name already ends with a number, that number is incremented.
+    Otherwise, the suffix "1" is appended.
+    The original extension is preserved unless `new_ext` is provided.
+
+    Args:
+        path (str): Full path of the original file.
+        new_ext (str): New extension (including the dot, ex., ".pdf").
+
+    Returns:
+        str: Full path of the file with the updated name.
+    """
     dir = os.path.dirname(path)
     base = os.path.basename(path)
     name, ext = os.path.splitext(base)
@@ -26,11 +39,36 @@ def bump_name(path, new_ext=None):
 
     return os.path.join(dir, new_name)
 
-def rename_and_move_file(file_path, new_file_name, new_file_path):
+
+def rename_and_move_file(file_path: str, new_file_name: str, new_file_path: str) -> None:
+    """
+    Rename a file and move it to a new directory.
+
+    Args:
+        file_path (str): Current path of the file to be renamed and moved.
+        new_file_name (str): New name for the file (without directory path).
+        new_file_path (str): Destination directory where the renamed file will be placed.
+
+    Returns:
+        None
+    """
     os.rename(file_path, new_file_name)
     shutil.move(new_file_name, new_file_path)
 
-def download_pdf(url, save_path):
+def download_pdf(url: str, save_path: str) -> None:
+    """
+    Download a PDF from a given URL and save it locally.
+
+    Args:
+        url (str): The URL of the PDF to download.
+        save_path (str): The local file path where the PDF will be saved.
+
+    Returns:
+        None
+
+    Raises:
+        ValueError: If the request or file write fails.
+    """
     try:
         response = requests.get(url)
         with open(save_path, 'wb') as f:
@@ -39,7 +77,16 @@ def download_pdf(url, save_path):
         print("Falha no Download!")
         raise ValueError(e)
 
-def extract_text_from_pdf(pdf_path):
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """
+    Extract all text content from a PDF file.
+
+    Args:
+        pdf_path (str): Path to the PDF file.
+
+    Returns:
+        str: Extracted text from all pages in the PDF.
+    """
     pdf_document = fitz.open(pdf_path)
     text = ""
     for page_num in range(len(pdf_document)):
@@ -47,11 +94,38 @@ def extract_text_from_pdf(pdf_path):
         text += page.get_text()
     return text
 
-def get_last_file_name(path):
-    return sorted(os.listdir(path))[-1]
+def get_last_file_name(dirpath: str) -> str:
+    """
+    Return the filename in `dirpath` that has the largest numeric suffix
+    immediately before the extension.
 
+    Args:
+        dirpath (str): Directory path to search.
+    
+    Returns:
+        str: The filename with the highest trailing number.
+    """
+    files = [f for f in os.listdir(dirpath) if os.path.isfile(os.path.join(dirpath, f))]
+    if not files:
+        raise FileNotFoundError(f"Diretório vazio: {dirpath!r}")
 
-def generate_html_diff(file1_lines, file2_lines):
+    def num_sufixo(fname: str) -> int:
+        m = re.search(r'(\d+)(?=\.[^.]+$)', fname)  # pega os dígitos antes da extensão
+        return int(m.group(1)) if m else -1
+
+    return max(files, key=num_sufixo)
+
+def generate_html_diff(file1_lines: list[str], file2_lines: list[str]) -> str:
+    """
+    Generate an HTML diff report between two versions of text files.
+
+    Args:
+        file1_lines (list[str]): Lines of the original file.
+        file2_lines (list[str]): Lines of the modified file.
+
+    Returns:
+        str: Full HTML string containing the diff report.
+    """
     differ = difflib.HtmlDiff(tabsize=2, wrapcolumn=90, charjunk=difflib.IS_CHARACTER_JUNK)
     table = differ.make_table(
                 file1_lines, file2_lines, 
