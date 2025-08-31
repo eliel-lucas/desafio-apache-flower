@@ -39,22 +39,6 @@ def bump_name(path: str, new_ext: str) -> str:
 
     return os.path.join(dir, new_name)
 
-
-def rename_and_move_file(file_path: str, new_file_name: str, new_file_path: str) -> None:
-    """
-    Rename a file and move it to a new directory.
-
-    Args:
-        file_path (str): Current path of the file to be renamed and moved.
-        new_file_name (str): New name for the file (without directory path).
-        new_file_path (str): Destination directory where the renamed file will be placed.
-
-    Returns:
-        None
-    """
-    os.rename(file_path, new_file_name)
-    shutil.move(new_file_name, new_file_path)
-
 def download_pdf(url: str, save_path: str) -> None:
     """
     Download a PDF from a given URL and save it locally.
