@@ -1,10 +1,10 @@
 import os
 import fitz  # PyMuPDF
-import shutil
+import logging
 import difflib, re
 import requests
 from zoneinfo import ZoneInfo 
-from datetime import datetime
+from datetime import datetime, timezone
 
 def bump_name(path: str, new_ext: str) -> str:
     """
@@ -60,6 +60,17 @@ def download_pdf(url: str, save_path: str) -> None:
     except Exception as e:
         print("Falha no Download!")
         raise ValueError(e)
+    
+def get_last_modified_date(url: str) -> datetime | None:
+    try:
+        response = requests.head(url, allow_redirects=True)
+        last_modified_str = response.headers.get('Last-Modified')
+        if last_modified_str:
+            return datetime.strptime(last_modified_str, '%a, %d %b %Y %H:%M:%S %Z').replace(tzinfo=timezone.utc)
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Erro ao acessar a URL para checar data: {e}")
+        return None
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """

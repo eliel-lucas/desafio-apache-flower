@@ -5,24 +5,23 @@ import smtplib
 import logging
 import requests
 from airflow import DAG
+from airflow.models import Variable
+from airflow.utils.task_group import TaskGroup
+from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
 from airflow.operators.python import BranchPythonOperator
-from airflow.operators.empty import EmptyOperator
-# from airflow.operators.email import EmailOperator
-from airflow.providers.smtp.operators.smtp import EmailOperator
-from airflow.models import Variable
 
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo 
 from weasyprint import HTML
 sys.path.append('/opt/airflow/scripts')
 from utils_pdf import (
-    get_last_file_name, 
-    extract_text_from_pdf, 
+    bump_name,
     download_pdf, 
-    generate_html_diff, 
-    bump_name
+    get_last_file_name, 
+    generate_html_diff,
+    extract_text_from_pdf, 
+    get_last_modified_date, 
 )
 from utils_slack import (
     get_upload_url_external,
@@ -38,6 +37,7 @@ CANAL_SLACK_NOTIFICAR_FALHA = Variable.get("CANAL_SLACK_NOTIFICAR_FALHA")
 API_KEY_SLACK = Variable.get("API_KEY_SLACK")
 RETRIES = int(Variable.get("RETRIES", default_var=3))
 TEMP_DIR = Variable.get("TEMP_DIR", default_var="/tmp")
+LAST_PROCESSED_DATE_STR = Variable.get("file_comparator_last_date", default_var=None)
 
 with DAG(
     dag_id='file_comparator',
@@ -73,6 +73,59 @@ with DAG(
         doc_md="Calcula os caminhos absolutos (arquivo novo, último versionado e último relatório) e publica via XCom.",
     )
 
+    def branch_on_date_check(ti):
+        """
+        Diverts flow based on date check.
+        """
+        update_needed = ti.xcom_pull(task_ids="check_for_new_version")
+        if update_needed:
+            return "process_file_update"
+        else:
+            return "task_end"
+
+    branch_on_date_check_task = BranchPythonOperator(
+        task_id="branch_on_date_check",
+        python_callable=branch_on_date_check,
+        dag=dag,
+        doc_md="Se uma nova versão for detectada, segue para o download. Caso contrário, encerra.",
+    )
+
+    def check_for_new_version(ti):
+        """
+        Verify that the file version on the server is newer than the last version that was successfully 
+        processed, based on an airflow variable.
+        """
+        server_mod_date_obj = get_last_modified_date(FILE_URL)
+        if not server_mod_date_obj:
+            logging.warning("Não foi possível obter a data do servidor. Prosseguindo por segurança.")
+            return True
+        
+        if not LAST_PROCESSED_DATE_STR:
+            logging.info("Nenhuma data de processamento anterior encontrada. Prosseguindo com o download.")
+            ti.xcom_push(key="server_last_modified", value=server_mod_date_obj.isoformat())
+            return True
+
+        last_processed_date_obj = datetime.fromisoformat(LAST_PROCESSED_DATE_STR)
+
+        logging.info(f"Data do servidor: {server_mod_date_obj}")
+        logging.info(f"Última data processada: {last_processed_date_obj}")
+        
+        if server_mod_date_obj > last_processed_date_obj:
+            ti.xcom_push(key="server_last_modified", value=server_mod_date_obj.isoformat())
+            return True
+        
+        return False
+
+
+    task_check_for_new_version = PythonOperator(
+        task_id="check_for_new_version",
+        python_callable=check_for_new_version,
+        dag=dag,
+        doc_md="Compare os dados Last-Modified do servidor com os dados do arquivo local para decidir se o download é necessário.",
+    )
+
+    process_file_update_group = TaskGroup(group_id="process_file_update")
+
     def download_file(ti):
         """
         Download the target PDF to the temporary comparison path.
@@ -90,6 +143,7 @@ with DAG(
         python_callable=download_file, 
         retries=RETRIES, 
         retry_delay=timedelta(minutes=1), 
+        task_group=process_file_update_group,
         # retry_exponential_backoff=True,
         # max_retry_delay=timedelta(minutes=15),
         dag=dag,
@@ -121,6 +175,7 @@ with DAG(
     task_compare_files = PythonOperator(
         task_id="compare_files", 
         python_callable=compare_files, 
+        task_group=process_file_update_group,
         dag=dag,
         doc_md="Extrai texto dos PDFs e indica se tem diferença; retorna is_diff e textos para o relatório.",
     )
@@ -132,16 +187,23 @@ with DAG(
         Returns:
             list[str] | str: downstream task id(s) to follow.
         """
-        is_diff = ti.xcom_pull(task_ids="compare_files")["is_diff"]
+        compare_result = ti.xcom_pull(task_ids="process_file_update.compare_files")
+        
+        if compare_result is None:
+            logging.error("A tarefa compare_files não retornou um resultado. Verifique os logs da tarefa anterior.")
+            raise ValueError("Resultado da comparação de arquivos está nulo (None).")
+            
+        is_diff = compare_result["is_diff"]
 
         if is_diff:
-            return ["rename_and_move_file", "generate_report"]
+            return ["process_file_update.rename_and_move_file", "process_file_update.generate_report"]
 
         return "task_end"
 
     branch_on_file_difference_task = BranchPythonOperator(
         task_id="branch_on_file_difference", 
         python_callable=branch_on_file_difference, 
+        task_group=process_file_update_group,
         dag=dag,
         doc_md="Desvia o fluxo: se tem diferença, segue para versionar e gerar relatório; caso contrário, encerra em tsk_end.",
     )
@@ -158,6 +220,7 @@ with DAG(
     task_rename_and_move_file = PythonOperator(
         task_id="rename_and_move_file",
         python_callable=rename_and_move_file, 
+        task_group=process_file_update_group,
         dag=dag,
         doc_md="Versiona o PDF novo e move para DATA_DIR.",
     )
@@ -167,7 +230,7 @@ with DAG(
         Build a styled HTML diff and write a PDF report into REPORT_DIR.
         """
         paths = ti.xcom_pull(task_ids="compute_paths")
-        compare_files_result = ti.xcom_pull(task_ids="compare_files")
+        compare_files_result = ti.xcom_pull(task_ids="process_file_update.compare_files")
 
         html_content = generate_html_diff(
            compare_files_result["old_file_text"].splitlines(keepends=True),
@@ -185,6 +248,7 @@ with DAG(
     task_generate_report = PythonOperator(
         task_id="generate_report",
         python_callable=generate_report, 
+        task_group=process_file_update_group,
         dag=dag,
         doc_md="Gera diff HTML e renderiza PDF em REPORT_DIR; publica report_pdf_path via XCom.",
     )
@@ -193,7 +257,7 @@ with DAG(
         """
         Send the generated diff report to Slack using the external upload flow.
         """
-        report_pdf_path = ti.xcom_pull(task_ids="generate_report", key="report_pdf_path")
+        report_pdf_path = ti.xcom_pull(task_ids="process_file_update.generate_report", key="report_pdf_path")
         report_filename = os.path.basename(report_pdf_path)
         report_size = os.path.getsize(report_pdf_path)
 
@@ -240,6 +304,7 @@ with DAG(
         retry_delay=timedelta(minutes=1),
         retry_exponential_backoff=True,
         max_retry_delay=timedelta(minutes=15),
+        task_group=process_file_update_group,
         dag=dag,
         doc_md="Publica o relatório no Slack",
     )
@@ -263,8 +328,30 @@ with DAG(
         task_id="notify_failure_slack",
         python_callable=notify_failure_slack,
         trigger_rule="one_failed",
+        task_group=process_file_update_group,
+        dag=dag,
         doc_md="Envia uma notificação para o slack em caso de falha no pipeline."
     )
+
+    def update_last_processed_date(ti):
+        """
+        Updates the Airflow Variable with the date of the version we just processed.
+        """
+        new_date_to_save = ti.xcom_pull(task_ids="check_for_new_version", key="server_last_modified")
+        if new_date_to_save:
+            logging.info(f"Atualizando a variável file_comparator_last_date para: {new_date_to_save}")
+            Variable.set("file_comparator_last_date", new_date_to_save)
+        else:
+            logging.warning("Nenhuma nova data encontrada para atualizar na variável.")
+
+    task_update_variable = PythonOperator(
+        task_id="update_last_processed_date",
+        python_callable=update_last_processed_date,
+        task_group=process_file_update_group,
+        dag=dag,
+        doc_md="Atualiza o Airflow Variable com a data da última versão processada com sucesso."
+    )
+
    
     task_end = EmptyOperator(
         task_id="task_end", 
@@ -273,28 +360,17 @@ with DAG(
         doc_md="Fim do fluxo quando não tem diferenças detectadas entre as versões do PDF.",
     )
 
-    def cleanup_tmp():
-        """"Deletes the temporary PDF file file_att.pdf."""
-        try:
-            os.remove(os.path.join(TEMP_DIR, "file_att.pdf"))
-        except FileNotFoundError:
-            pass
-
-    task_cleanup = PythonOperator(
-        task_id="cleanup_tmp",
-        python_callable=cleanup_tmp,
-        trigger_rule="all_done",
-    )
-
-    compute_paths_task >> download_file_task
+    compute_paths_task >> task_check_for_new_version >> branch_on_date_check_task
+    branch_on_date_check_task >> download_file_task
+    branch_on_date_check_task >> task_end
     download_file_task >> task_compare_files
     task_compare_files >> branch_on_file_difference_task
     branch_on_file_difference_task >> [task_rename_and_move_file, task_generate_report]
     branch_on_file_difference_task >> task_end
     task_generate_report >> task_send_notification_on_slack
     [download_file_task, task_compare_files, task_rename_and_move_file, task_generate_report, task_send_notification_on_slack] >> task_notify_failure_slack
-    task_send_notification_on_slack >> task_end
-    task_end >> task_cleanup
+    task_send_notification_on_slack >> task_update_variable
+    task_update_variable >> task_end
 
 
 
